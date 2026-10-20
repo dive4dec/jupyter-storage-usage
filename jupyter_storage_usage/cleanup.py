@@ -195,11 +195,13 @@ class CleanupHandler(JupyterHandler):
             raise web.HTTPError(403, str(e))
 
         usage_bytes = await _du_async(HOME_DIR)
-        usage_status = (
-            "over_limit" if usage_bytes > HARD_LIMIT_BYTES
-            else "warning" if usage_bytes > WARN_LIMIT_BYTES
-            else "ok"
-        )
+        # hard_limit 0 = no limit (standalone): never over_limit.
+        if HARD_LIMIT_BYTES > 0 and usage_bytes > HARD_LIMIT_BYTES:
+            usage_status = "over_limit"
+        elif usage_bytes > WARN_LIMIT_BYTES:
+            usage_status = "warning"
+        else:
+            usage_status = "ok"
 
         if os.path.isdir(fs_path):
             await self._render_dir(sub_path, fs_path, usage_bytes, usage_status)
@@ -403,6 +405,8 @@ class CleanupHandler(JupyterHandler):
             "⚠️" if usage_status == "warning" else "✅")
 
         # Show the student's actual limits, not confusing totals
+        limit_str = _fmt_bytes(HARD_LIMIT_BYTES) if HARD_LIMIT_BYTES else "no limit"
+        pct_str = f"({pct:.1f}%)" if HARD_LIMIT_BYTES else ""
         if usage_status == "over_limit":
             over_by = usage_bytes - HARD_LIMIT_BYTES
             banner = (
@@ -431,8 +435,7 @@ class CleanupHandler(JupyterHandler):
 <div class="ctn">{banner}</div>
 <div class="bar-container">
   <div style="font-size:13px;margin-bottom:4px">
-    <b>{_fmt_bytes(usage_bytes)}</b> used / <b>{_fmt_bytes(HARD_LIMIT_BYTES)}</b> limit
-    ({pct:.1f}%) · warn at {_fmt_bytes(WARN_LIMIT_BYTES)}
+    <b>{_fmt_bytes(usage_bytes)}</b> used / <b>{limit_str}</b> {pct_str} · warn at {_fmt_bytes(WARN_LIMIT_BYTES)}
   </div>
   <div class="bar"><div style="width:{min(pct,100):.1f}%;background:{color}"></div></div>
 </div>

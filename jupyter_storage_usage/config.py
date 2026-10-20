@@ -63,11 +63,17 @@ HOME_DIR = _env_str("JSU_HOME_DIR", "/home/jovyan")
 # Default: 10 GiB (matches hub-side default)
 WARN_LIMIT_BYTES = _env_quantity("JSU_WARN_LIMIT_BYTES", 10 * 1024**3)
 
-# Hard limit — hub will cull + block spawn; server goes read-only
-# Default: 20 GiB (matches hub-side default)
-# Note: the pre-spawn hook injects the resolved per-user/group limits
-# into the pod env, overriding these defaults.
-HARD_LIMIT_BYTES = _env_quantity("JSU_HARD_LIMIT_BYTES", 20 * 1024**3)
+# Hard limit — hub will cull + block spawn; server goes read-only.
+# Default: 0 = NO LIMIT (unlimited).
+#   - On a JupyterHub, the hub's pre-spawn hook ALWAYS injects the resolved
+#     per-user/group limit (hub-side default 20Gi, or a per-user/group
+#     override like ccha23) into JSU_HARD_LIMIT_BYTES, so the pod never sees
+#     this code default on the hub — hubs keep their configured limit.
+#   - Only a standalone `docker run` (no hub, env var unset) falls to this
+#     default -> unlimited. The widget renders "no limit" when the value is 0.
+#   - Set explicitly for a standalone box: JSU_HARD_LIMIT_BYTES=20Gi (or
+#     "unlimited" to force no limit; see quantity.parse_quantity).
+HARD_LIMIT_BYTES = _env_quantity("JSU_HARD_LIMIT_BYTES", 0)
 
 # How often to check usage locally (seconds)
 # Default: 1800 (30 min). Persistent cache on NFS means staleness is acceptable.

@@ -52,7 +52,14 @@ class UsageData:
     percent: float = field(init=False)
 
     def __post_init__(self):
-        if self.used_bytes > self.hard_limit:
+        # hard_limit == 0 means "no limit" (standalone / unconfigured): never
+        # over_limit, percent 0. The hub always injects a real limit, so this
+        # branch only affects standalone runs.
+        if self.hard_limit <= 0:
+            self.status = (
+                "warning" if self.used_bytes > self.warn_limit else "ok"
+            )
+        elif self.used_bytes > self.hard_limit:
             self.status = "over_limit"
         elif self.used_bytes > self.warn_limit:
             self.status = "warning"
@@ -66,6 +73,12 @@ class UsageData:
 
     def to_dict(self) -> dict:
         from .quantity import format_bytes
+        # hard_limit 0 = no limit; render "unlimited" so the widget/tooltips
+        # never show a confusing "0" or "0Gi".
+        if self.hard_limit > 0:
+            hard_display = format_bytes(self.hard_limit)
+        else:
+            hard_display = "unlimited"
         return {
             "used_bytes": self.used_bytes,
             "used_display": format_bytes(self.used_bytes),
@@ -73,7 +86,7 @@ class UsageData:
             "warn_limit_bytes": self.warn_limit,
             "warn_limit_display": format_bytes(self.warn_limit),
             "hard_limit_bytes": self.hard_limit,
-            "hard_limit_display": format_bytes(self.hard_limit),
+            "hard_limit_display": hard_display,
             "percent": self.percent,
             "status": self.status,
             "timestamp": self.timestamp,

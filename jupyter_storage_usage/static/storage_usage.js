@@ -92,8 +92,12 @@ function updateStatusBarItem(el, data) {
   const used = data.used_display || (data.used_bytes / 1073741824).toFixed(1) + 'Gi';
   const hard = data.hard_limit_display || (data.hard_limit_bytes / 1073741824).toFixed(1) + 'Gi';
   const warn = data.warn_limit_display || (data.warn_limit_bytes / 1073741824).toFixed(1) + 'Gi';
+  const unlimited = (data.hard_limit_bytes === 0);
 
-  el.textContent = `${statusIcon(data.status)} ${used} / ${hard}`;
+  // No hard limit (standalone / unconfigured): show usage only, no "/ limit".
+  el.textContent = unlimited
+    ? `${statusIcon(data.status)} ${used}`
+    : `${statusIcon(data.status)} ${used} / ${hard}`;
   el.style.color = statusColor(data.status);
 
   const ageSec = Math.round((Date.now() / 1000) - data.timestamp);
@@ -101,10 +105,14 @@ function updateStatusBarItem(el, data) {
                  ageSec < 3600 ? `${Math.round(ageSec/60)}m ago` :
                  `${Math.round(ageSec/3600)}h ago`;
   const ts = new Date(data.timestamp * 1000).toLocaleTimeString();
-  el.title = `Storage: ${used} used of ${hard} limit\n` +
-    `Warn at ${warn}\n` +
-    `Last checked: ${ts} (${ageStr})\n` +
-    `Status: ${data.status}`;
+  el.title = unlimited
+    ? `Storage: ${used} used (no limit)\n` +
+      `Last checked: ${ts} (${ageStr})\n` +
+      `Status: ${data.status}`
+    : `Storage: ${used} used of ${hard} limit\n` +
+      `Warn at ${warn}\n` +
+      `Last checked: ${ts} (${ageStr})\n` +
+      `Status: ${data.status}`;
 }
 
 function init() {

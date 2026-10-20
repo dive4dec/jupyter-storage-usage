@@ -53,11 +53,17 @@ def parse_quantity(s: str) -> int:
     """Parse a Kubernetes-style quantity string into bytes (int).
 
     Raises ValueError if the string is not a valid quantity.
+
+    Special values: "unlimited" / "none" / "infinity" (case-insensitive)
+    parse to 0, meaning "no limit".
     """
     if not s or not isinstance(s, str):
         raise ValueError(f"Invalid quantity: {s!r}")
 
     s = s.strip()
+    if s.lower() in ("unlimited", "none", "infinity", "inf", "-"):
+        return 0
+
     match = _PATTERN.match(s)
     if not match:
         raise ValueError(f"Invalid quantity: {s!r}")

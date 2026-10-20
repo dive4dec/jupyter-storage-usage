@@ -41,6 +41,21 @@ def test_usage_data_to_dict():
     assert "hard_limit_display" in result
 
 
+def test_usage_data_unlimited():
+    """hard_limit == 0 means NO limit (standalone / unconfigured):
+    never over_limit, percent 0, display 'unlimited'."""
+    # Well over the warn limit but no hard limit -> warning, not over_limit.
+    d = UsageData(used_bytes=500, total_bytes=1000, warn_limit=100, hard_limit=0, timestamp=0)
+    assert d.status == "warning"
+    assert d.percent == 0.0
+    assert d.to_dict()["hard_limit_display"] == "unlimited"
+
+    # Under the warn limit too -> ok.
+    d = UsageData(used_bytes=10, total_bytes=1000, warn_limit=100, hard_limit=0, timestamp=0)
+    assert d.status == "ok"
+    assert d.percent == 0.0
+
+
 def test_du_bytes():
     """Test du on a temp directory with known content."""
     tmpdir = tempfile.mkdtemp()
