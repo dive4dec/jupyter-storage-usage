@@ -12,6 +12,20 @@ def _load_jupyter_server_extension(server_app):
     from .handlers import setup_handlers
     setup_handlers(server_app)
 
+    # In cleanup mode, start the background du that keeps the portal's
+    # usage cache fresh (pages never block on disk usage).
+    from .config import CLEANUP_MODE
+    if CLEANUP_MODE:
+        def _start_usage_refresh():
+            from .cleanup import start_usage_refresh
+            try:
+                start_usage_refresh()
+                server_app.log.info("jupyter-storage-usage: background usage refresh started")
+            except Exception as e:
+                server_app.log.error("jupyter-storage-usage: usage refresh start failed: %s", e)
+        from tornado.ioloop import IOLoop
+        IOLoop.current().add_callback(_start_usage_refresh)
+
     # Start the periodic monitor after the server's event loop is running.
     # During extension loading the loop may not be active yet, so we defer
     # using tornado's IOLoop.add_callback which schedules on the next tick.

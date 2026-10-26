@@ -28,7 +28,14 @@ from urllib.parse import quote, unquote
 from jupyter_server.base.handlers import JupyterHandler
 from tornado import web
 
-from .config import HARD_LIMIT_BYTES, HOME_DIR, HUB_REPORT_URL, WARN_LIMIT_BYTES
+from .config import (
+    CLEANUP_DU_MAX_SECONDS,
+    HARD_LIMIT_BYTES,
+    HOME_DIR,
+    HUB_REPORT_URL,
+    USAGE_CACHE_REFRESH_SEC,
+    WARN_LIMIT_BYTES,
+)
 
 logger = logging.getLogger("jupyter_storage_usage")
 
@@ -58,53 +65,156 @@ def _resolve_safe(base: str, sub: str) -> str:
     return full
 
 
-def _du_path(path: str) -> int:
-    """Get apparent size of a file or directory in bytes.
+# ── Background du cache (portal never blocks on disk usage) ─────────────
+#
+# The old portal ran `du` over the home dir AND over every top-level
+# directory, sequentially, on EVERY page load. On a 0.5 CPU cleanup pod
+# with a large NFS-backed home, a single full du takes minutes, so the
+# first render (and often every render) appeared stuck loading forever.
+#
+# Now: one `du --max-depth=1 --apparent-size` (home total + every
+# top-level dir in a single pass) runs in a background task, started at
+# server boot and refreshed every USAGE_CACHE_REFRESH_SEC. Pages render
+# immediately and show cached sizes or "…" until the first du lands.
 
-    Uses `du -sb` for directories (total recursive size) and os.stat
-    for files.  Returns 0 on failure (never raises).
+def _run_du_maxdepth1() -> tuple[int, dict[str, int]]:
+    """Single du pass: home total + each top-level entry's size.
+
+    One `du --max-depth=1 --apparent-size` over HOME_DIR replaces the old
+    "1 du for the home + N du for every top-level dir" (N+1 passes) with
+    one pass.  The last line of du's output is the total; preceding lines
+    are the direct children, keyed by basename.
+    """
+    r = subprocess.run(
+        [
+            "du", "--max-depth=1", "--apparent-size", "--block-size=1",
+            "--", HOME_DIR,
+        ],
+        capture_output=True, text=True,
+        timeout=CLEANUP_DU_MAX_SECONDS,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0, {}
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return 0, {}
+    total = int(lines[-1].split("\t")[0])
+    sizes: dict[str, int] = {}
+    for ln in lines[:-1]:
+        parts = ln.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            sz = int(parts[0])
+        except ValueError:
+            continue
+        name = os.path.basename(parts[1].rstrip("/"))
+        if name:
+            sizes[name] = sz
+    return total, sizes
+
+
+class _UsageCache:
+    """In-process cache of home-dir usage from the background du."""
+
+    def __init__(self) -> None:
+        self.total: int | None = None
+        self.dir_sizes: dict[str, int] = {}
+        self.computed_at: float | None = None  # when the current data was computed
+        self.started_at: float | None = None   # when the current du started
+        self._inflight: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def fresh(self) -> bool:
+        return (
+            self.total is not None
+            and self.computed_at is not None
+            and (time.monotonic() - self.computed_at) < USAGE_CACHE_REFRESH_SEC
+        )
+
+    def invalidate(self) -> None:
+        """Drop the data (e.g. after a delete); next refresh recomputes."""
+        self.total = None
+        self.computed_at = None
+        self.started_at = None
+
+    async def _run_one(self) -> None:
+        """Perform one du (thread) and publish the result on this cache."""
+        try:
+            total, sizes = await asyncio.to_thread(_run_du_maxdepth1)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            logger.info("Background du failed (will retry next cycle): %s", e)
+            return
+        self.total = total
+        self.dir_sizes = sizes
+        self.computed_at = time.monotonic()
+        self.started_at = None
+        logger.info(
+            "Usage cache updated: %.2f GiB total, %d top-level entries",
+            total / _GIB, len(sizes),
+        )
+
+
+_USAGE_CACHE = _UsageCache()
+
+
+async def _compute_usage() -> None:
+    """Run one du in the background; skip if data is still fresh."""
+    cache = _USAGE_CACHE
+    if cache.fresh:
+        return
+    async with cache._lock:
+        if cache.fresh:
+            return
+        if cache._inflight is not None:
+            return
+        cache.started_at = time.monotonic()
+        cache._inflight = asyncio.get_running_loop().create_task(cache._run_one())
+
+
+async def _ensure_usage_cached(wait: bool = False) -> None:
+    """Kick the background du (always non-blocking) and optionally wait.
+
+    wait=True is used by the post-delete hub report: it waits for the
+    in-flight du to land (bounded by CLEANUP_DU_MAX_SECONDS) so the
+    reported number is accurate. Pages never wait.
+    """
+    await _compute_usage()
+    if not wait or _USAGE_CACHE.fresh:
+        return
+    task = _USAGE_CACHE._inflight
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=CLEANUP_DU_MAX_SECONDS)
+    except asyncio.TimeoutError:
+        logger.info("Background du exceeded %.0fs — leaving stale cache", CLEANUP_DU_MAX_SECONDS)
+
+
+def start_usage_refresh() -> None:
+    """Schedule the background du: initial warm + periodic refresh.
+
+    Called once from the extension loader in cleanup mode. No-op if the
+    event loop isn't running yet (the loader defers this via IOLoop).
     """
     try:
-        st = os.stat(path)
-        if stat.S_ISDIR(st.st_mode):
-            r = subprocess.run(
-                ["du", "-sb", path],
-                capture_output=True, text=True, timeout=60,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                return int(r.stdout.split()[0])
-            return 0
-        return st.st_size
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return 0
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_compute_usage())  # initial warm
+    loop.create_task(_periodic_usage_refresh())
 
 
-async def _scan_dir_async(path: str) -> list[dict]:
-    """List directory contents with sizes, sorted by size descending."""
-    def _scan(p: str) -> list[dict]:
-        entries = []
+async def _periodic_usage_refresh() -> None:
+    """Keep the du cache fresh in the background, forever."""
+    while True:
+        await asyncio.sleep(USAGE_CACHE_REFRESH_SEC)
         try:
-            for name in os.listdir(p):
-                full = os.path.join(p, name)
-                try:
-                    st = os.stat(full)
-                    is_dir = stat.S_ISDIR(st.st_mode)
-                    size = _du_path(full) if is_dir else st.st_size
-                    entries.append({
-                        "name": name, "size": size,
-                        "is_dir": is_dir, "mtime": st.st_mtime,
-                    })
-                except OSError:
-                    continue
-        except OSError:
-            pass
-        entries.sort(key=lambda e: e["size"], reverse=True)
-        return entries
-    return await asyncio.to_thread(_scan, path)
-
-
-async def _du_async(path: str) -> int:
-    return await asyncio.to_thread(_du_path, path)
+            await _compute_usage()
+            await _ensure_usage_cached(wait=False)
+        except Exception as e:  # never let the periodic task die
+            logger.warning("Usage refresh cycle failed: %s", e)
 
 
 # ── Unified handler ─────────────────────────────────────────────────────
@@ -147,13 +257,23 @@ class CleanupHandler(JupyterHandler):
     async def _report_usage_to_hub(self):
         """Report fresh storage usage to the hub after a delete.
 
-        Recomputes du on the home directory and POSTs it to the hub's
+        Triggers the background du and POSTs the fresh total to the hub's
         /report endpoint so the cache is updated immediately (not after
         the next 30-min poll).  Best-effort: errors are logged but don't
         block the delete response.
+
+        This is the ONE place we wait for a du — a delete just changed
+        the home dir, so the cached number is stale.  The wait is bounded
+        by CLEANUP_DU_MAX_SECONDS and only happens in the delete handler,
+        never on page loads.
         """
         try:
-            used = await _du_async(HOME_DIR)
+            _USAGE_CACHE.invalidate()
+            await _ensure_usage_cached(wait=True)
+            used = _USAGE_CACHE.total
+            if used is None:
+                logger.info("Skipping hub usage report — du not ready yet")
+                return
             import urllib.request, urllib.parse, os
             hub_url = HUB_REPORT_URL
             if not hub_url:
@@ -194,19 +314,24 @@ class CleanupHandler(JupyterHandler):
         except ValueError as e:
             raise web.HTTPError(403, str(e))
 
-        usage_bytes = await _du_async(HOME_DIR)
+        # Kick the background du if it's stale, but NEVER wait for it here.
+        # The page renders immediately from the cache (or with "…").
+        await _compute_usage()
+        usage = _USAGE_CACHE
+        computing = not usage.fresh
+        total = usage.total if usage.total is not None else 0
         # hard_limit 0 = no limit (standalone): never over_limit.
-        if HARD_LIMIT_BYTES > 0 and usage_bytes > HARD_LIMIT_BYTES:
+        if HARD_LIMIT_BYTES > 0 and total > HARD_LIMIT_BYTES:
             usage_status = "over_limit"
-        elif usage_bytes > WARN_LIMIT_BYTES:
+        elif total > WARN_LIMIT_BYTES:
             usage_status = "warning"
         else:
             usage_status = "ok"
 
         if os.path.isdir(fs_path):
-            await self._render_dir(sub_path, fs_path, usage_bytes, usage_status)
+            await self._render_dir(sub_path, fs_path, usage, computing)
         elif os.path.isfile(fs_path):
-            self._render_file(sub_path, fs_path, usage_bytes, usage_status)
+            self._render_file(sub_path, fs_path, usage, computing)
         else:
             raise web.HTTPError(404, "File not found")
 
@@ -368,14 +493,26 @@ class CleanupHandler(JupyterHandler):
     # ── Rendering ───────────────────────────────────────────────────────
 
     async def _render_dir(self, sub_path: str, fs_path: str,
-                          usage_bytes: int, usage_status: str):
-        entries = await _scan_dir_async(fs_path)
-        # ... (same rendering as before — kept compact)
+                          usage: "_UsageCache", computing: bool):
+        """Render a directory listing from the du cache (never blocks on du).
+
+        File sizes come from the background du cache when available.
+        While the cache is still computing (or went stale after a delete)
+        the size cells show "…" and the page auto-refreshes every few
+        seconds until the du lands.
+        """
+        entries = await asyncio.to_thread(self._list_dir_sync, fs_path)
+        at_root = not sub_path.strip("/")
+        sizes = usage.dir_sizes if at_root else {}
         rows = []
         for e in entries:
             n = html.escape(e["name"])
             link = self._cleanup_url(quote(os.path.join(sub_path, e["name"])))
-            sz = _fmt_bytes(e["size"])
+            if e["is_dir"]:
+                sz = sizes.get(e["name"]) if at_root else None
+            else:
+                sz = e["size"]
+            sz_str = "…" if (e["is_dir"] and sz is None) else _fmt_bytes(sz if sz is not None else e["size"])
             mt = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["mtime"]))
             ic = "📁" if e["is_dir"] else "📄"
             if e["is_dir"]:
@@ -387,7 +524,7 @@ class CleanupHandler(JupyterHandler):
                 dl = f"<a href='{link}?download=1'>⬇️</a>"
             rows.append(
                 f"<tr><td>{ic}</td><td><a href='{link}'>{n}</a></td>"
-                f"<td>{sz}</td><td style='color:#888'>{mt}</td>"
+                f"<td>{sz_str}</td><td style='color:#888'>{mt}</td>"
                 f"<td>{dl} "
                 f"<form method='POST' action='{link}' style='display:inline' "
                 f"onsubmit=\"return confirm('Delete {n}?')\">"
@@ -398,7 +535,15 @@ class CleanupHandler(JupyterHandler):
             '<tr><td colspan=5 style="text-align:center;color:#888;padding:40px">'
             "Empty directory</td></tr>"
         )
-        pct = (usage_bytes / HARD_LIMIT_BYTES * 100) if HARD_LIMIT_BYTES else 0
+        total = usage.total if usage.total is not None else 0
+        pct = (total / HARD_LIMIT_BYTES * 100) if HARD_LIMIT_BYTES else 0
+        # hard_limit 0 = no limit (standalone): never over_limit.
+        if HARD_LIMIT_BYTES > 0 and total > HARD_LIMIT_BYTES:
+            usage_status = "over_limit"
+        elif total > WARN_LIMIT_BYTES:
+            usage_status = "warning"
+        else:
+            usage_status = "ok"
         color = "#e84855" if usage_status == "over_limit" else (
             "#f0a000" if usage_status == "warning" else "#4caf50")
         icon = "🚫" if usage_status == "over_limit" else (
@@ -407,35 +552,48 @@ class CleanupHandler(JupyterHandler):
         # Show the student's actual limits, not confusing totals
         limit_str = _fmt_bytes(HARD_LIMIT_BYTES) if HARD_LIMIT_BYTES else "no limit"
         pct_str = f"({pct:.1f}%)" if HARD_LIMIT_BYTES else ""
-        if usage_status == "over_limit":
-            over_by = usage_bytes - HARD_LIMIT_BYTES
+        total_str = _fmt_bytes(total) if not computing else "…"
+        if usage_status == "over_limit" and not computing:
+            over_by = total - HARD_LIMIT_BYTES
             banner = (
                 f'<div class="banner over">{icon} <b>Storage limit exceeded.</b><br>'
-                f'You are using <b>{_fmt_bytes(usage_bytes)}</b> of your '
+                f'You are using <b>{_fmt_bytes(total)}</b> of your '
                 f'<b>{_fmt_bytes(HARD_LIMIT_BYTES)}</b> limit '
                 f'(<b>{pct:.0f}%</b> — {over_by // (1024*1024)} MiB over).<br>'
                 f'Delete files below to get under <b>{_fmt_bytes(HARD_LIMIT_BYTES)}</b>, '
                 f'then restart your server from JupyterHub.'
             )
-        elif usage_status == "warning":
+        elif usage_status == "warning" and not computing:
             banner = (
                 f'<div class="banner warn">{icon} <b>Approaching storage limit.</b><br>'
-                f'You are using <b>{_fmt_bytes(usage_bytes)}</b> of your '
+                f'You are using <b>{_fmt_bytes(total)}</b> of your '
                 f'<b>{_fmt_bytes(HARD_LIMIT_BYTES)}</b> limit (<b>{pct:.0f}%</b>).'
             )
         else:
             banner = ""
+        if computing:
+            banner = (
+                f'<div class="banner warn">⏳ <b>Computing storage sizes…</b><br>'
+                'Your home directory is large; sizes load in the background '
+                'and this page refreshes automatically.'
+            )
 
         crumbs = self._breadcrumbs(sub_path)
         hub_url = os.environ.get("JUPYTERHUB_BASE_URL", "/")
-
+        # Auto-refresh the page while the background du is still running,
+        # so the student never sees a frozen "computing" screen.
+        meta_refresh = (
+            f'<meta http-equiv="refresh" content="{USAGE_CACHE_REFRESH_SEC}">'
+            if not computing else
+            '<meta http-equiv="refresh" content="5">'
+        )
         self.set_header("Content-Type", "text/html")
-        self.write(_PAGE_CSS + f"""
+        self.write(_PAGE_CSS + meta_refresh + f"""
 <div class="hdr"><h1>💾 Storage Cleanup</h1><a href="{hub_url}home">← JupyterHub</a></div>
 <div class="ctn">{banner}</div>
 <div class="bar-container">
   <div style="font-size:13px;margin-bottom:4px">
-    <b>{_fmt_bytes(usage_bytes)}</b> used / <b>{limit_str}</b> {pct_str} · warn at {_fmt_bytes(WARN_LIMIT_BYTES)}
+    <b>{total_str}</b> used / <b>{limit_str}</b> {pct_str} · warn at {_fmt_bytes(WARN_LIMIT_BYTES)}
   </div>
   <div class="bar"><div style="width:{min(pct,100):.1f}%;background:{color}"></div></div>
 </div>
@@ -446,8 +604,37 @@ class CleanupHandler(JupyterHandler):
 <div class="ft">Browse · Delete · Download — no upload</div>
 </div></body></html>""")
 
+    @staticmethod
+    def _list_dir_sync(fs_path: str) -> list[dict]:
+        """Cheap directory listing: os.listdir + stat, NO recursive du.
+
+        Directory sizes are filled in from the du cache by the caller,
+        so this stays fast even on large NFS homes.
+        """
+        entries = []
+        try:
+            for name in os.listdir(fs_path):
+                full = os.path.join(fs_path, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                is_dir = stat.S_ISDIR(st.st_mode)
+                entries.append({
+                    "name": name,
+                    "size": st.st_size,
+                    "is_dir": is_dir,
+                    "mtime": st.st_mtime,
+                })
+        except OSError:
+            pass
+        # Directories sort first (by name) so the "biggest" listing isn't
+        # gated on sizes that may still be computing; stable and predictable.
+        entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+        return entries
+
     def _render_file(self, sub_path: str, fs_path: str,
-                     usage_bytes: int, usage_status: str):
+                     usage: "_UsageCache", computing: bool):
         st = os.stat(fs_path)
         name = html.escape(os.path.basename(fs_path))
         size = _fmt_bytes(st.st_size)

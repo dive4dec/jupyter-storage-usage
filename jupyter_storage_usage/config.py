@@ -80,6 +80,23 @@ HARD_LIMIT_BYTES = _env_quantity("JSU_HARD_LIMIT_BYTES", 0)
 # The du runs with nice -n 19 to avoid competing with user workloads.
 CHECK_INTERVAL_SEC = _env_int("JSU_CHECK_INTERVAL_SEC", 1800)
 
+# ── Cleanup portal du cache ──────────────────────────────────────────────
+# The cleanup portal used to run `du` over the home dir AND over every
+# top-level directory, synchronously, on every page load. On a 0.5 CPU
+# cleanup pod with a large NFS-backed home that blocks the first (and
+# often every) page render for minutes — the portal appeared stuck
+# loading forever. Instead, a single `du --max-depth=1` now runs in the
+# background (started at server boot, refreshed periodically) and its
+# result is cached in-process. Portal pages render immediately and show
+# cached sizes or "computing…" — the du NEVER blocks a request.
+#
+# Refresh interval for the background du (seconds).
+USAGE_CACHE_REFRESH_SEC = _env_int("JSU_USAGE_CACHE_REFRESH_SEC", 60)
+# Hard ceiling for one background du (seconds). The task is cancelled
+# past this and the cache is left for the next cycle, so a pathological
+# home cannot even pin a worker thread indefinitely.
+CLEANUP_DU_MAX_SECONDS = _env_int("JSU_CLEANUP_DU_MAX_SECONDS", 300)
+
 # ── Cleanup mode ────────────────────────────────────────────────────────
 # When JSU_CLEANUP_MODE=1, the server extension takes over the root URL
 # and serves the cleanup portal (restricted file manager) instead of
